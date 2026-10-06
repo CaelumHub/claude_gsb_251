@@ -6,8 +6,54 @@ from nlp import (get_keywords, get_ner, get_parser, get_segmenter,
                  get_sentiment, get_summarizer, get_tagger, get_translator,
                  get_constituency_parser)
 from nlp.lexicon import STOPWORDS
+from nlp.proofreader import Proofreader
+from nlp.revision import apply_edits
 
 from .stage import Stage
+
+
+def _proofread(ctx, params):
+    """自动校对：高置信度错误直接修正，全部发现写入上下文供审阅。
+
+    - ``auto_apply``（默认 true）：自动应用 high 严重度的修改；
+      medium/low 仅记录，交给人工在页面确认。
+    - 修正后的文本回写到 ``text``（保留原文于 ``raw_text``），
+      下游所有阶段自然消费「改后文本」，改哪一处、怎么改都对得上。
+    """
+    import time
+    text = ctx.get("text", "")
+    raw_text = ctx.get("raw_text", text)
+    timeout = float(params.get("doc_timeout", 8.0))
+    findings = Proofreader(
+        whitelist=params.get("whitelist"),
+        deadline=time.time() + timeout,
+        check_missing=bool(params.get("check_missing", True)),
+    ).proofread(text)
+    applied_count = int(ctx.get("proof_applied_count", 0))
+    if params.get("auto_apply", True):
+        chosen = [f for f in findings
+                  if f["severity"] == "high"
+                  and f["category"] != "punct_pair"]
+        if chosen:
+            edits = [{
+                "id": f["id"], "start": f["start"], "end": f["end"],
+                "replacement": f["replacement"], "original": f["original"],
+                "insert_at": f.get("insert_at"),
+                "insert_text": f.get("insert_text"),
+            } for f in chosen]
+            try:
+                text, applied, _ = apply_edits(text, edits)
+                applied_count += len(applied)
+                applied_ids = {a.finding_id for a in applied}
+                findings = [f for f in findings if f["id"] not in applied_ids]
+            except Exception:  # noqa: BLE001
+                pass
+    return {
+        "text": text,
+        "raw_text": raw_text,
+        "proof_findings": findings,
+        "proof_applied_count": applied_count,
+    }
 
 
 def _clean(ctx, params):
@@ -71,6 +117,11 @@ def _parse(ctx, params):
 
 
 BUILTIN_STAGES = [
+    Stage("proofread", _proofread, inputs=["text"],
+          outputs=["text", "raw_text", "proof_findings"],
+          description="文本校对：自动修正高置信错别字/标点，其余供人工确认",
+          params={"auto_apply": True, "check_missing": True,
+                  "doc_timeout": 8.0}),
     Stage("clean", _clean, inputs=["text"], outputs=["clean_text"],
           description="文本清洗：去空白、去停用词", params={"remove_stopwords": True}),
     Stage("segment", _segment, inputs=["text", "clean_text"], outputs=["words"],

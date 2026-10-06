@@ -153,6 +153,29 @@ class ShardedStore:
             self._write_meta(meta)
             return record_id
 
+    def update(self, record_id: str, changes: dict) -> Optional[dict]:
+        """在排他锁内读-改-写一条记录，返回更新后的记录；不存在返回 None。
+
+        供「语料校对后文本回流」使用：调用方在同一个锁内拿到旧记录、
+        合并 ``changes``、写回，避免与其它写入/批量扫描互相覆盖。
+        """
+        with FileLock(lock_path_for(self.meta_path)):
+            meta = self._read_meta()
+            for index in range(meta.get("shard_count", 0)):
+                path = self._shard_path(index)
+                with FileLock(lock_path_for(path)):
+                    records = self._read_shard(index)
+                    for i, record in enumerate(records):
+                        if record.get("id") == record_id and \
+                                not record.get("_deleted"):
+                            updated = dict(record)
+                            updated.update(changes)
+                            updated["_updated"] = time.time()
+                            records[i] = updated
+                            self._write_shard(index, records)
+                            return updated
+        return None
+
     def insert_many(self, records: Iterable[dict]) -> list[str]:
         """批量插入（事务式：要么全部成功，要么抛出）。"""
         ids: list[str] = []

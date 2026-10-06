@@ -288,6 +288,59 @@ table.data tr:hover td { background: var(--surface-2); }
 /* 语料预览 */
 .preview { font-size: 13px; color: var(--text-muted); white-space: pre-wrap; max-height: 160px; overflow: auto; }
 
+/* ---------- 文本校对高亮 ---------- */
+.proof-text {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 9px; padding: 18px 20px; white-space: pre-wrap;
+  font-family: var(--sans); font-size: 15px; line-height: 2.1;
+  max-height: 60vh; overflow: auto;
+}
+.pf-highlight {
+  border-radius: 4px; padding: 0 2px; cursor: pointer;
+  border-bottom: 2px solid; position: relative;
+}
+.pf-highlight:hover { filter: brightness(0.96); }
+.pf-highlight.pf-active { outline: 2px solid var(--primary); outline-offset: 1px; }
+.pf-highlight.pf-high { background: #fee2e2; border-color: var(--red); color: #991b1b; }
+.pf-highlight.pf-medium { background: #fef3c7; border-color: var(--amber); color: #92400e; }
+.pf-highlight.pf-low { background: #e0f2fe; border-color: #0ea5e9; color: #075985; }
+.pf-highlight.pf-ignored {
+  background: transparent; border-bottom: 1px dashed #cbd5e1;
+  color: var(--text-muted); opacity: .55; cursor: default;
+}
+.pf-caret {
+  display: inline-block; width: 5px; background: #0ea5e9;
+  color: transparent; margin: 0 1px; border-radius: 2px;
+}
+.pf-fix {
+  font-weight: 700; padding: 0 4px; border-radius: 4px;
+  background: #dcfce7; color: #166534; margin-left: 4px;
+}
+.pf-item {
+  border: 1px solid var(--border); border-left: 4px solid var(--border);
+  border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
+  background: var(--surface); transition: box-shadow .15s;
+}
+.pf-item:hover { box-shadow: var(--shadow); }
+.pf-item.sev-high { border-left-color: var(--red); }
+.pf-item.sev-medium { border-left-color: var(--amber); }
+.pf-item.sev-low { border-left-color: #0ea5e9; }
+.pf-item.ignored { opacity: .5; background: var(--surface-2); }
+.pf-item.applied { border-left-color: var(--green); background: #f0fdf4; }
+.pf-item .pf-orig { font-weight: 700; }
+.pf-item .pf-arrow { color: var(--text-muted); margin: 0 4px; }
+.pf-item .pf-context { color: var(--text-muted); font-size: 12px; margin-top: 3px; }
+.pf-item .pf-reason { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.pf-filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.pf-filters label { display: inline-flex; align-items: center; gap: 4px; margin: 0; font-size: 13px; cursor: pointer; }
+.pf-batch-bar {
+  position: sticky; top: 0; z-index: 5; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 9px; padding: 10px 14px;
+  margin-bottom: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+}
+.progress-bar { height: 8px; border-radius: 999px; background: #e5e7eb; overflow: hidden; min-width: 120px; flex: 1; }
+.progress-bar > div { height: 100%; background: var(--primary); transition: width .3s; }
+
 /* 句法树 */
 .tree-wrap { overflow: auto; }
 .tree-node { display: inline-block; text-align: center; }

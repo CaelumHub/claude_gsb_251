@@ -16,12 +16,18 @@ from .summarizer import Summarizer
 from .translator import Translator
 from .keywords import KeywordExtractor
 from .embeddings import WordEmbeddings
+from .proofreader import Proofreader, ProofTimeout, proofread_text
+from .revision import (AppliedEdit, EditConflict, EditSet, apply_edits,
+                       remap_finding, remap_findings)
 from . import lexicon, text, hmm
 
 __all__ = [
     "Segmenter", "POSTagger", "DependencyParser", "ConstituencyParser",
     "NERExtractor", "SentimentAnalyzer", "Summarizer", "Translator",
     "KeywordExtractor", "WordEmbeddings",
+    "Proofreader", "ProofTimeout", "proofread_text",
+    "AppliedEdit", "EditConflict", "EditSet", "apply_edits",
+    "remap_finding", "remap_findings",
     "TAG_NAMES", "TAGSET", "DEP_REL_NAMES", "PHRASE_NAMES", "ENTITY_TYPE_NAMES",
     "POLARITY_NAMES", "lexicon", "text", "hmm",
     "get_segmenter", "get_tagger", "get_parser", "get_ner", "get_sentiment",
@@ -78,3 +84,8 @@ def get_keywords() -> KeywordExtractor:
 
 def get_embeddings() -> WordEmbeddings:
     return _singleton("embeddings", WordEmbeddings)
+
+
+def get_proofreader(**kwargs) -> Proofreader:
+    """每次返回新的校对器（校对参数/截止时刻按调用变化，不做单例）。"""
+    return Proofreader(**kwargs)

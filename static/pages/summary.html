@@ -24,6 +24,7 @@
       <label>输入文本（多句）</label>
       <textarea id="text" style="min-height:180px">自然语言处理是人工智能的重要分支。它研究如何让计算机理解、分析并生成人类语言。分词是自然语言处理的基础任务，其准确性直接影响下游任务。词性标注为每个词标注语法类别。命名实体识别从文本中抽取人名、地名与机构名。情感分析判断文本的正负面倾向。文本摘要自动提炼文章的核心内容。机器翻译实现不同语言之间的自动转换。这些技术共同构成了自然语言处理的核心体系。</textarea>
       <div class="row mt">
+        <select id="corpus-sel" style="max-width:260px"><option value="">— 从语料库选择 —</option></select>
         <div style="flex:1">
           <label>摘要比例：<span id="ratio-val">30%</span></label>
           <input type="range" id="ratio" min="10" max="60" value="30">
@@ -48,6 +49,28 @@
 <script>
 renderNav("summary.html");
 
+const _params = new URLSearchParams(location.search);
+const _corpusId = _params.get("corpus");
+let _textVersion = _params.get("v");
+(async function initCorpus() {
+  try {
+    const data = await api("/api/corpus");
+    $("#corpus-sel").innerHTML = '<option value="">— 从语料库选择 —</option>' +
+      data.corpora.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");
+    if (_corpusId) {
+      $("#corpus-sel").value = _corpusId;
+      const r = await api(`/api/corpus/${_corpusId}`);
+      $("#text").value = r.text; _textVersion = r.version || 1;
+      if (_params.get("run") === "1") doSummary();
+    }
+  } catch (_) {}
+})();
+$("#corpus-sel").addEventListener("change", async (e) => {
+  if (!e.target.value) return;
+  const r = await api(`/api/corpus/${e.target.value}`);
+  $("#text").value = r.text; _textVersion = r.version || 1;
+});
+
 $("#ratio").addEventListener("input", (e) => {
   $("#ratio-val").textContent = e.target.value + "%";
 });
@@ -59,8 +82,11 @@ async function doSummary() {
   setLoading(btn, true, "生成中…");
   try {
     const ratio = parseInt($("#ratio").value) / 100;
-    const r = await api("/api/summary", { method: "POST", body: { text, ratio } });
-    $("#summary").textContent = r.summary;
+    const r = await api("/api/summary", { method: "POST",
+      body: { text, ratio, corpus_id: _corpusId || $("#corpus-sel").value || undefined,
+              text_version: _textVersion ? Number(_textVersion) : undefined } });
+    $("#summary").textContent = r.summary +
+      (r.text_version ? `（基于文本 v${r.text_version}）` : "");
     $("#sentences").innerHTML = r.sentences.map(s => `
       <div class="sent ${s.selected ? "selected" : ""}">
         <span class="score">${s.score}</span>

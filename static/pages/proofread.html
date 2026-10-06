@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>文本校对 - NLP 流水线平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">文本校对</h1>
+    <p class="page-desc">自动扫描同音字（在/再）、形近字（己/已）、错词成语、多字漏字与引号括号不闭合；逐处高亮，一键应用或忽略，改后文本即时回流分词/情感/摘要。</p>
+
+    <!-- 工具栏：选语料 + 批量扫描 -->
+    <section class="card">
+      <div class="toolbar">
+        <select id="corpus-sel" style="max-width:300px"><option value="">— 选择语料 —</option></select>
+        <button class="btn" id="btn-scan">扫描本篇</button>
+        <button class="btn secondary" id="btn-batch">批量扫描全部</button>
+        <label style="display:inline-flex;align-items:center;gap:5px;margin:0">
+          <input type="checkbox" id="chk-missing" checked> 检测漏字（疑似）</label>
+        <input type="text" id="whitelist-input" placeholder="白名单词（方言/专名/新写法，回车添加）"
+               style="max-width:240px;display:inline-block;padding:7px 10px;font-size:13px">
+        <span class="badge blue" id="job-badge" style="display:none"></span>
+      </div>
+      <div id="batch-progress" style="display:none">
+        <div class="toolbar" style="margin-bottom:6px">
+          <span class="small muted" id="batch-label"></span>
+          <span class="badge green" id="batch-ok"></span>
+          <span class="badge red" id="batch-fail"></span>
+        </div>
+        <div class="progress-bar"><div id="batch-fill" style="width:0%"></div></div>
+      </div>
+    </section>
+
+    <div class="grid cols-2">
+      <!-- 左：文本高亮 -->
+      <section class="card">
+        <div class="toolbar">
+          <h2 style="margin:0;flex:1" id="text-title">文本</h2>
+          <span class="badge blue" id="version-badge"></span>
+          <button class="btn secondary small" id="btn-undo" title="撤销最近一次应用">↶ 撤销</button>
+          <a class="btn secondary small" id="btn-goto-seg" href="#">分词→</a>
+          <a class="btn secondary small" id="btn-gto-sent" href="#">情感→</a>
+          <a class="btn secondary small" id="btn-goto-sum" href="#">摘要→</a>
+        </div>
+        <div class="pf-filters mb">
+          <label><input type="checkbox" class="f-cat" value="homophone" checked> 同音字</label>
+          <label><input type="checkbox" class="f-cat" value="shape" checked> 形近字</label>
+          <label><input type="checkbox" class="f-cat" value="word" checked> 错词成语</label>
+          <label><input type="checkbox" class="f-cat" value="duplicate" checked> 多字</label>
+          <label><input type="checkbox" class="f-cat" value="missing" checked> 漏字</label>
+          <label><input type="checkbox" class="f-cat" value="punct_pair" checked> 引号括号</label>
+          <label><input type="checkbox" class="f-cat" value="punct_misuse" checked> 标点误用</label>
+        </div>
+        <div id="proof-text" class="proof-text muted">请先选择语料并扫描，或在右侧直接粘贴文本扫描。</div>
+      </section>
+
+      <!-- 右：问题清单 -->
+      <section class="card">
+        <div class="toolbar">
+          <h2 style="margin:0;flex:1">疑似问题 <span id="count-badge" class="badge blue"></span></h2>
+          <button class="btn small" id="btn-apply-all">全部应用（高置信）</button>
+          <button class="btn secondary small" id="btn-ignore-all">全部忽略</button>
+        </div>
+        <div id="finding-list" class="list" style="max-height:55vh;overflow:auto">
+          <div class="muted small">尚未扫描。</div>
+        </div>
+      </section>
+    </div>
+
+    <!-- 直接粘贴扫描 -->
+    <section class="card">
+      <h2>临时文本扫描（不落库）</h2>
+      <textarea id="adhoc-text" placeholder="粘贴一段文本，扫描后可查看建议（不会保存到语料库）…"></textarea>
+      <div class="mt"><button class="btn secondary" id="btn-adhoc">扫描临时文本</button></div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("proofread.html");
+
+const state = {
+  corpusId: null, text: "", version: 1,
+  findings: [], ignored: new Set(), applied: new Set(), whitelist: [],
+  activeId: null, filter: new Set(["homophone","shape","word","duplicate","missing","punct_pair","punct_misuse"]),
+};
+
+/* ---------- 语料下拉 ---------- */
+async function loadCorpora() {
+  const data = await api("/api/corpus");
+  $("#corpus-sel").innerHTML = '<option value="">— 选择语料 —</option>' +
+    data.corpora.map(c => `<option value="${esc(c.id)}">${esc(c.name)}（${c.length}字 · v${c.version || 1}）</option>`).join("");
+}
+$("#corpus-sel").addEventListener("change", async (e) => {
+  const id = e.target.value;
+  if (!id) return;
+  await loadCorpusDetail(id);
+});
+
+async function loadCorpusDetail(id) {
+  state.corpusId = id;
+  const r = await api(`/api/proofread/${id}`);
+  state.text = r.text;
+  state.version = r.text_version;
+  state.findings = r.findings || [];
+  state.ignored = new Set(r.ignored_ids || []);
+  state.applied = new Set();
+  state.whitelist = r.whitelist || [];
+  renderWhitelist();
+  $("#text-title").textContent = r.name || "文本";
+  $("#version-badge").textContent = `文本版本 v${r.version}`;
+  bindGotoLinks(id);
+  render();
+}
+
+function bindGotoLinks(id) {
+  $("#btn-goto-seg").href = `/page/segment.html?corpus=${id}&v=${state.version}`;
+  $("#btn-gto-sent").href = `/page/sentiment.html?corpus=${id}&v=${state.version}`;
+  $("#btn-goto-sum").href = `/page/summary.html?corpus=${id}&v=${state.version}`;
+}
+
+/* ---------- 渲染 ---------- */
+function visibleFindings() {
+  return state.findings.filter(f =>
+    state.filter.has(f.category) &&
+    !state.applied.has(f.id));
+}
+
+function render() {
+  const fs = visibleFindings();
+  const counts = { high: 0, medium: 0, low: 0 };
+  fs.forEach(f => { if (!state.ignored.has(f.id)) counts[f.severity]++; });
+  const activeCount = counts.high + counts.medium + counts.low;
+  $("#count-badge").textContent = activeCount ? `${activeCount} 处待处理` : "无";
+  $("#proof-text").innerHTML = renderProofText(state.text, fs, {
+    ignored: state.ignored, activeIds: state.activeId ? [state.activeId] : [],
+  });
+  $$("#proof-text .pf-highlight").forEach(el => {
+    el.addEventListener("click", () => {
+      state.activeId = el.dataset.fid;
+      render();
+      const item = document.querySelector(`[data-fid-item="${el.dataset.fid}"]`);
+      if (item) item.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+  });
+  // 清单
+  const list = $("#finding-list");
+  if (!fs.length) {
+    list.innerHTML = `<div class="muted small">${state.findings.length ? "已全部处理或被筛选隐藏。" : "没有发现问题。"}</div>`;
+  } else {
+    list.innerHTML = fs.map(f => renderFindingItem(f)).join("");
+    list.querySelectorAll("[data-apply]").forEach(b => b.addEventListener("click", () => applyOne(b.dataset.apply)));
+    list.querySelectorAll("[data-ignore]").forEach(b => b.addEventListener("click", () => ignoreOne(b.dataset.ignore)));
+    list.querySelectorAll("[data-restore]").forEach(b => b.addEventListener("click", () => ignoreOne(b.dataset.restore, "restore")));
+  }
+}
+
+function renderFindingItem(f) {
+  const isIgnored = state.ignored.has(f.id);
+  const cat = PROOF_CATEGORY_NAMES[f.category] || f.category;
+  const sev = PROOF_SEVERITY_NAMES[f.severity] || f.severity;
+  const fixText = f.end > f.start
+    ? `<span class="pf-orig">${esc(f.original)}</span><span class="pf-arrow">→</span><span class="pf-fix">${esc(f.replacement)}</span>`
+    : `<span class="pf-arrow">补</span><span class="pf-fix">${esc(f.insert_text || f.replacement)}</span>`;
+  return `<div class="pf-item sev-${f.severity} ${isIgnored ? "ignored" : ""}" data-fid-item="${esc(f.id)}">
+    <div class="toolbar" style="margin-bottom:2px">
+      <span class="badge ${f.severity==="high"?"red":f.severity==="medium"?"amber":""}">${sev}</span>
+      <span class="badge">${cat}</span>
+      <span style="flex:1"></span>
+      ${isIgnored
+        ? `<button class="btn secondary small" data-restore="${esc(f.id)}">恢复</button>`
+        : `<button class="btn small" data-apply="${esc(f.id)}">应用</button>
+           <button class="btn secondary small" data-ignore="${esc(f.id)}">忽略</button>`}
+    </div>
+    <div>${fixText}</div>
+    <div class="pf-reason">${esc(f.reason)}</div>
+    <div class="pf-context">…${esc(f.context)}…</div>
+  </div>`;
+}
+
+/* ---------- 白名单 ---------- */
+function renderWhitelist() {
+  $("#whitelist-input").value = state.whitelist.join("、");
+  $("#whitelist-input").title = state.whitelist.length
+    ? "白名单：" + state.whitelist.join("、") : "白名单词（回车保存到语料）";
+}
+$("#whitelist-input").addEventListener("keydown", async (e) => {
+  if (e.key !== "Enter" || !state.corpusId) {
+    if (e.key === "Enter") toast("请先选择语料再保存白名单", "err");
+    return;
+  }
+  const words = e.target.value.split(/[、,，\s]+/).map(s => s.trim()).filter(Boolean);
+  // 白名单保存到语料记录，随后重新扫描
+  const reg = await _registryUpdateWhitelist(words);
+  if (reg) { state.whitelist = words; toast("白名单已保存，重新扫描…"); scanCurrent(); }
+});
+async function _registryUpdateWhitelist(words) {
+  // 通过 apply 接口没有白名单写入，单独走一个轻量端点
+  try {
+    await api(`/api/corpus/${state.corpusId}/whitelist`, {
+      method: "POST", body: { whitelist: words },
+    });
+    return true;
+  } catch (e) { toast(e.message, "err"); return false; }
+}
+
+/* ---------- 扫描 ---------- */
+async function scanCurrent() {
+  if (!state.corpusId) return toast("请先选择语料", "err");
+  const btn = $("#btn-scan");
+  setLoading(btn, true, "扫描中…");
+  try {
+    const r = await api(`/api/proofread/scan`, {
+      method: "POST",
+      body: { corpus_id: state.corpusId, check_missing: $("#chk-missing").checked,
+              whitelist: state.whitelist },
+    });
+    state.findings = r.findings; state.version = r.text_version;
+    state.applied = new Set();
+    render();
+    toast(`扫描完成：${r.stats.total} 处（高 ${r.stats.severity.high}）`);
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+$("#btn-scan").addEventListener("click", scanCurrent);
+
+$("#btn-adhoc").addEventListener("click", async () => {
+  const text = $("#adhoc-text").value.trim();
+  if (!text) return toast("请输入文本", "err");
+  try {
+    const r = await api("/api/proofread/scan", {
+      method: "POST", body: { text, check_missing: $("#chk-missing").checked },
+    });
+    state.corpusId = null; state.text = text; state.version = null;
+    state.findings = r.findings; state.ignored = new Set(); state.applied = new Set();
+    $("#version-badge").textContent = "临时文本";
+    $("#text-title").textContent = "临时文本";
+    render();
+    toast(`发现 ${r.stats.total} 处疑似问题`);
+  } catch (e) { toast(e.message, "err"); }
+});
+
+/* ---------- 应用 / 忽略 ---------- */
+async function applyEdits(edits) {
+  if (!state.corpusId) return toast("临时文本不能保存应用，请在语料中操作", "err");
+  if (!edits.length) return;
+  try {
+    const r = await api(`/api/corpus/${state.corpusId}/proofread/apply`, {
+      method: "POST",
+      body: { edits, base_version: state.version },
+    });
+    edits.forEach(e => state.applied.add(e.id));
+    state.text = r.text; state.version = r.text_version;
+    state.findings = r.findings;
+    bindGotoLinks(state.corpusId);
+    render();
+    toast(`已应用 ${edits.length} 处，文本更新为 v${r.text_version}`);
+    return true;
+  } catch (e) {
+    if (e.message.includes("版本")) {
+      toast("文本已被他人修改，正在刷新…", "err");
+      await loadCorpusDetail(state.corpusId);
+    } else toast(e.message, "err");
+    return false;
+  }
+}
+
+async function applyOne(id) {
+  const f = state.findings.find(x => x.id === id);
+  if (!f) return;
+  state.activeId = id;
+  await applyEdits([{
+    id: f.id, start: f.start, end: f.end, replacement: f.replacement,
+    original: f.original, insert_at: f.insert_at, insert_text: f.insert_text,
+  }]);
+}
+
+async function ignoreOne(id, mode = "ignore") {
+  try {
+    const r = await api(`/api/corpus/${state.corpusId}/proofread/ignore`, {
+      method: "POST", body: { ids: [id], mode },
+    });
+    state.ignored = new Set(r.ignored_ids);
+    render();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+$("#btn-apply-all").addEventListener("click", async () => {
+  const edits = visibleFindings()
+    .filter(f => f.severity === "high" && !state.ignored.has(f.id))
+    .map(f => ({ id: f.id, start: f.start, end: f.end, replacement: f.replacement,
+                 original: f.original, insert_at: f.insert_at, insert_text: f.insert_text }));
+  if (!edits.length) return toast("没有高置信度的可应用项");
+  if (!confirm(`将应用 ${edits.length} 处高置信修改，继续？`)) return;
+  await applyEdits(edits);
+});
+
+$("#btn-ignore-all").addEventListener("click", async () => {
+  const ids = visibleFindings().filter(f => !state.ignored.has(f.id)).map(f => f.id);
+  if (!ids.length) return;
+  const r = await api(`/api/corpus/${state.corpusId}/proofread/ignore`, {
+    method: "POST", body: { ids, mode: "ignore" },
+  });
+  state.ignored = new Set(r.ignored_ids);
+  render();
+  toast(`已忽略 ${ids.length} 处`);
+});
+
+$("#btn-undo").addEventListener("click", async () => {
+  if (!state.corpusId) return;
+  try {
+    const r = await api(`/api/corpus/${state.corpusId}/proofread/undo`, { method: "POST" });
+    state.text = r.text; state.version = r.text_version;
+    state.findings = r.findings; state.applied = new Set();
+    bindGotoLinks(state.corpusId);
+    render();
+    toast("已撤销最近一次校对");
+  } catch (e) { toast(e.message, "err"); }
+});
+
+/* ---------- 类别筛选 ---------- */
+$$(".f-cat").forEach(cb => cb.addEventListener("change", () => {
+  state.filter = new Set($$(".f-cat").filter(x => x.checked).map(x => x.value));
+  render();
+}));
+
+/* ---------- 批量扫描 ---------- */
+$("#btn-batch").addEventListener("click", async () => {
+  try {
+    const r = await api("/api/proofread/batch", {
+      method: "POST",
+      body: { doc_timeout: 8, max_workers: 4, check_missing: $("#chk-missing").checked,
+              whitelist: state.whitelist },
+    });
+    pollJob(r.job_id, r.total);
+  } catch (e) { toast(e.message, "err"); }
+});
+
+function pollJob(jobId, total) {
+  $("#batch-progress").style.display = "";
+  $("#job-badge").style.display = "";
+  const timer = setInterval(async () => {
+    const s = await api(`/api/proofread/job/${jobId}`);
+    const pct = Math.round(s.done / s.total * 100);
+    $("#batch-fill").style.width = pct + "%";
+    $("#batch-label").textContent = `批量扫描 ${s.done}/${s.total}`;
+    $("#batch-ok").textContent = `成功 ${s.succeeded}`;
+    $("#batch-fail").textContent = s.failed ? `超时/失败 ${s.failed}（已跳过）` : "";
+    $("#job-badge").textContent = s.status;
+    if (["done", "partial", "failed"].includes(s.status)) {
+      clearInterval(timer);
+      toast(`批量扫描完成：${s.succeeded} 篇成功，${s.failed} 篇跳过`);
+      await loadCorpora();
+    }
+  }, 600);
+}
+
+loadCorpora().then(() => {
+  const cid = new URLSearchParams(location.search).get("corpus");
+  if (cid) {
+    $("#corpus-sel").value = cid;
+    loadCorpusDetail(cid);
+  }
+});
+</script>
+</body>
+</html>

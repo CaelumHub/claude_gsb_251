@@ -19,6 +19,8 @@ from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
                  get_tagger, get_translator, ENTITY_TYPE_NAMES, TAG_NAMES,
                  DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
 from nlp.lexicon import STOPWORDS
+from nlp.revision import (AppliedEdit, EditConflict, apply_edits,
+                          remap_findings)
 from storage import StoreRegistry
 
 
@@ -37,6 +39,10 @@ def _engine():
     return current_app.config["PIPELINE_ENGINE"]
 
 
+def _proofs():
+    return current_app.config["PROOF_SERVICE"]
+
+
 def _models_dir() -> str:
     import os
     path = os.path.join(current_app.config["DATA_ROOT"], "models")
@@ -45,10 +51,16 @@ def _models_dir() -> str:
 
 
 def _store_result(task: str, text: str, result: dict,
-                  corpus_id: Optional[str] = None) -> str:
+                  corpus_id: Optional[str] = None,
+                  text_version: Optional[int] = None) -> str:
     record = {"text": text, "result": result, "created_at": time.time()}
     if corpus_id:
         record["corpus_id"] = corpus_id
+    if text_version is not None:
+        record["text_version"] = text_version
+        # 供结果列表按版本对齐：同语料同版本的结果才代表「当前文本」
+        record["source"] = {"corpus_id": corpus_id,
+                            "text_version": text_version}
     return _registry().task(task).insert(record)
 
 
@@ -57,17 +69,22 @@ def _payload() -> dict:
     return data
 
 
-def _resolve_text(data: dict) -> tuple[str, Optional[str]]:
-    """从请求中取文本：优先 text，其次 corpus_id。"""
+def _resolve_text(data: dict) -> tuple[str, Optional[str], Optional[int]]:
+    """从请求中取文本：优先 text，其次 corpus_id。
+
+    返回 (text, corpus_id, text_version)；语料来源时附带当前版本号，
+    下游任务结果据此记录「基于哪个版本的文本」，保证改前改后对得上。
+    """
     if data.get("text"):
-        return data["text"], data.get("corpus_id")
+        return data["text"], data.get("corpus_id"), data.get("text_version")
     corpus_id = data.get("corpus_id")
     if corpus_id:
         record = _registry().task("corpus").get(corpus_id)
         if record:
-            return record.get("text", ""), corpus_id
-        return "", corpus_id
-    return "", None
+            return record.get("text", ""), corpus_id, \
+                int(record.get("version", 1))
+        return "", corpus_id, None
+    return "", None, None
 
 
 def _clean(text: str, remove_stopwords: bool = True) -> dict:
@@ -127,6 +144,9 @@ def list_corpus():
         "id": r.get("id"),
         "name": r.get("name", "未命名"),
         "length": len(r.get("text", "")),
+        "version": int(r.get("version", 1)),
+        "ignored_count": len(r.get("ignored_findings", [])),
+        "last_proof_at": r.get("last_proof_at"),
         "created_at": r.get("created_at"),
         "preview": r.get("text", "")[:80],
     } for r in records if not r.get("_deleted")]
@@ -143,9 +163,12 @@ def create_corpus():
     record = {
         "name": data.get("name") or f"语料_{int(time.time())}",
         "text": text,
+        "version": 1,
+        "whitelist": data.get("whitelist") or [],
         "created_at": time.time(),
     }
     rid = _registry().task("corpus").insert(record)
+    _schedule_auto_scan(rid)
     return jsonify({"id": rid, "ok": True})
 
 
@@ -165,9 +188,36 @@ def upload_corpus():
     if text is None:
         return jsonify({"error": "无法解码文件内容"}), 400
     name = data_name = file.filename or "上传文件"
-    record = {"name": name, "text": text.strip(), "created_at": time.time()}
+    record = {"name": name, "text": text.strip(), "version": 1,
+              "created_at": time.time()}
     rid = _registry().task("corpus").insert(record)
+    _schedule_auto_scan(rid)
     return jsonify({"id": rid, "name": name, "length": len(text), "ok": True})
+
+
+def _schedule_auto_scan(cid: str) -> None:
+    """入库后后台自动扫描一次（不阻塞响应；失败静默，可在页面手动重扫）。"""
+    import threading
+
+    app = current_app._get_current_object()
+
+    def _job():
+        with app.app_context():
+            try:
+                record = _registry().task("corpus").get(cid)
+                if not record:
+                    return
+                findings = _proofs().scan_text(
+                    record.get("text", ""),
+                    whitelist=record.get("whitelist"),
+                    timeout=10.0)
+                _proofs()._persist(cid, record.get("text", ""), findings,
+                                   int(record.get("version", 1)),
+                                   record.get("whitelist"))
+            except Exception:  # noqa: BLE001
+                pass
+
+    threading.Thread(target=_job, daemon=True).start()
 
 
 @api.get("/corpus/<cid>")
@@ -196,34 +246,258 @@ def clean_corpus(cid: str):
 
 
 # ---------------------------------------------------------------------------
+# 文本校对（错别字 / 标点扫描、应用、忽略、撤销、批量任务）
+# ---------------------------------------------------------------------------
+
+def _finding_stats(findings: list[dict]) -> dict:
+    sev = {"high": 0, "medium": 0, "low": 0}
+    cats: dict[str, int] = {}
+    for f in findings:
+        sev[f["severity"]] = sev.get(f["severity"], 0) + 1
+        cats[f["category"]] = cats.get(f["category"], 0) + 1
+    return {"total": len(findings), "severity": sev, "categories": cats}
+
+
+@api.post("/corpus/<cid>/whitelist")
+def update_whitelist(cid: str):
+    """保存语料级白名单（方言/专名/刻意新写法），扫描时豁免。"""
+    record = _registry().task("corpus").get(cid)
+    if not record:
+        return jsonify({"error": "语料不存在"}), 404
+    words = _payload().get("whitelist")
+    if words is None:
+        return jsonify({"error": "缺少 whitelist"}), 400
+    words = [str(w).strip() for w in words if str(w).strip()]
+    _registry().task("corpus").update(cid, {"whitelist": words})
+    return jsonify({"ok": True, "whitelist": words})
+
+
+@api.post("/proofread/scan")
+def proofread_scan():
+    """扫描任意文本（不落库），或扫描某篇语料（同时持久化扫描结果）。"""
+    data = _payload()
+    timeout = float(data.get("doc_timeout", 8.0))
+    whitelist = data.get("whitelist") or []
+    check_missing = bool(data.get("check_missing", True))
+    cid = data.get("corpus_id")
+    if cid:
+        record = _registry().task("corpus").get(cid)
+        if not record:
+            return jsonify({"error": "语料不存在"}), 404
+        text = record.get("text", "")
+        version = int(record.get("version", 1))
+        findings = _proofs().scan_text(text, whitelist=whitelist,
+                                       timeout=timeout,
+                                       check_missing=check_missing)
+        _proofs()._persist(cid, text, findings, version, whitelist)
+        return jsonify({"corpus_id": cid, "text_version": version,
+                        "findings": findings, "stats": _finding_stats(findings)})
+    text = data.get("text") or ""
+    if not text:
+        return jsonify({"error": "缺少文本"}), 400
+    findings = _proofs().scan_text(text, whitelist=whitelist,
+                                   timeout=timeout,
+                                   check_missing=check_missing)
+    return jsonify({"findings": findings, "stats": _finding_stats(findings)})
+
+
+@api.get("/proofread/<cid>")
+def proofread_status(cid: str):
+    """某篇语料最近一次扫描结果 + 当前文本版本。"""
+    record = _registry().task("corpus").get(cid)
+    if not record:
+        return jsonify({"error": "语料不存在"}), 404
+    scan = _proofs().latest_scan(cid)
+    ignored = record.get("ignored_findings", [])
+    return jsonify({
+        "corpus_id": cid,
+        "text": record.get("text", ""),
+        "text_version": int(record.get("version", 1)),
+        "name": record.get("name", ""),
+        "findings": (scan or {}).get("findings", []),
+        "scan_text_version": (scan or {}).get("text_version"),
+        "ignored_ids": ignored,
+        "whitelist": record.get("whitelist", []),
+        "stats": _finding_stats((scan or {}).get("findings", [])),
+        "history": record.get("proof_history", []),
+    })
+
+
+@api.post("/proofread/batch")
+def proofread_batch():
+    """批量扫描多篇语料，立即返回 job_id，前端轮询进度。"""
+    data = _payload()
+    registry = _registry()
+    corpus_ids = data.get("corpus_ids") or []
+    if not corpus_ids:
+        # 默认扫描全部
+        corpus_ids = [r["id"] for r in registry.task("corpus").all()
+                      if not r.get("_deleted")]
+    if not corpus_ids:
+        return jsonify({"error": "没有可扫描的语料"}), 400
+    job = _proofs().start_batch(
+        corpus_ids,
+        max_workers=int(data.get("max_workers", 4)),
+        chunk_size=int(data.get("chunk_size", 16)),
+        doc_timeout=float(data.get("doc_timeout", 8.0)),
+        whitelist=data.get("whitelist") or [],
+        check_missing=bool(data.get("check_missing", True)))
+    return jsonify({"job_id": job.job_id, "total": job.total, "ok": True})
+
+
+@api.get("/proofread/job/<job_id>")
+def proofread_job(job_id: str):
+    job = _proofs().get_job(job_id)
+    if not job:
+        return jsonify({"error": "扫描任务不存在或已过期"}), 404
+    return jsonify(job.snapshot())
+
+
+def _serialize_applied(applied: list[AppliedEdit]) -> list[dict]:
+    return [{
+        "finding_id": a.finding_id, "old_start": a.old_start,
+        "old_end": a.old_end, "new_start": a.new_start,
+        "new_end": a.new_end, "original": a.original,
+        "replacement": a.replacement, "rule": a.rule,
+        "category": a.category,
+    } for a in applied]
+
+
+@api.post("/corpus/<cid>/proofread/apply")
+def proofread_apply(cid: str):
+    """应用一组校对修改，文本立即回流（版本 +1），并增量刷新扫描结果。"""
+    record = _registry().task("corpus").get(cid)
+    if not record:
+        return jsonify({"error": "语料不存在"}), 404
+    data = _payload()
+    edits = data.get("edits")
+    if not edits:
+        return jsonify({"error": "没有要应用的修改"}), 400
+    base_version = int(data.get("base_version", record.get("version", 1)))
+    current_version = int(record.get("version", 1))
+    if base_version != current_version:
+        return jsonify({
+            "error": f"文本版本已过期（当前 v{current_version}，"
+                     f"你基于 v{base_version}），请刷新后重试",
+            "stale": True, "current_version": current_version,
+        }), 409
+    text = record.get("text", "")
+    try:
+        new_text, applied, new_version = apply_edits(
+            text, edits, base_version=base_version,
+            expected_version=current_version)
+    except EditConflict as exc:
+        return jsonify({"error": str(exc), "conflict": True}), 409
+
+    # 未处理的 finding 重映射，再增量扫描合并
+    scan = _proofs().latest_scan(cid) or {}
+    old_findings = scan.get("findings", [])
+    applied_ids = {a.finding_id for a in applied}
+    remaining = [f for f in old_findings if f["id"] not in applied_ids]
+    refreshed = _proofs().rescan_after_revision(
+        cid, new_text, new_version, applied, remaining,
+        whitelist=record.get("whitelist"))
+
+    # 历史记录（保留最近 20 次，便于撤销/审计）
+    history = list(record.get("proof_history", []))
+    history.append({
+        "version": new_version,
+        "at": time.time(),
+        "changes": _serialize_applied(applied),
+        "old_text": text,
+    })
+    history = history[-20:]
+    _registry().task("corpus").update(cid, {
+        "text": new_text, "version": new_version,
+        "proof_history": history,
+        "last_proof_at": time.time(),
+    })
+    return jsonify({
+        "ok": True, "text": new_text, "text_version": new_version,
+        "applied": _serialize_applied(applied),
+        "findings": refreshed["findings"],
+        "stats": _finding_stats(refreshed["findings"]),
+        "ignored_ids": record.get("ignored_findings", []),
+    })
+
+
+@api.post("/corpus/<cid>/proofread/ignore")
+def proofread_ignore(cid: str):
+    """忽略/恢复一处或多处 finding（记录到语料，重扫不再提示）。"""
+    record = _registry().task("corpus").get(cid)
+    if not record:
+        return jsonify({"error": "语料不存在"}), 404
+    data = _payload()
+    ids = set(data.get("ids") or [])
+    mode = data.get("mode", "ignore")  # ignore | restore
+    ignored = set(record.get("ignored_findings", []))
+    if mode == "restore":
+        ignored -= ids
+    else:
+        ignored |= ids
+    _registry().task("corpus").update(cid, {"ignored_findings": sorted(ignored)})
+    return jsonify({"ok": True, "ignored_ids": sorted(ignored)})
+
+
+@api.post("/corpus/<cid>/proofread/undo")
+def proofread_undo(cid: str):
+    """撤销最近一次校对应用（回滚文本与版本）。"""
+    record = _registry().task("corpus").get(cid)
+    if not record:
+        return jsonify({"error": "语料不存在"}), 404
+    history = list(record.get("proof_history", []))
+    if not history:
+        return jsonify({"error": "没有可撤销的校对记录"}), 400
+    last = history.pop()
+    old_text = last["old_text"]
+    version = int(last["version"]) - 1
+    _registry().task("corpus").update(cid, {
+        "text": old_text, "version": max(1, version),
+        "proof_history": history,
+    })
+    # 重新扫描回滚后的文本
+    findings = _proofs().scan_text(old_text,
+                                   whitelist=record.get("whitelist"))
+    _proofs()._persist(cid, old_text, findings, max(1, version),
+                       record.get("whitelist"))
+    return jsonify({"ok": True, "text": old_text,
+                    "text_version": max(1, version),
+                    "findings": findings,
+                    "stats": _finding_stats(findings)})
+
+
+# ---------------------------------------------------------------------------
 # 分词与词性标注
 # ---------------------------------------------------------------------------
 
 @api.post("/segment")
 def segment():
     data = _payload()
-    text, cid = _resolve_text(data)
+    text, cid, ver = _resolve_text(data)
     if not text:
         return jsonify({"error": "缺少文本"}), 400
     seg = get_segmenter()
     words = seg.cut(text)
     result = {"words": words, "count": len(words)}
-    rid = _store_result("segment", text, result, corpus_id=cid)
+    rid = _store_result("segment", text, result, corpus_id=cid,
+                        text_version=ver)
     result["id"] = rid
+    result["text_version"] = ver
     return jsonify(result)
 
 
 @api.post("/pos")
 def pos_tag():
     data = _payload()
-    text, cid = _resolve_text(data)
+    text, cid, ver = _resolve_text(data)
     if not text:
         return jsonify({"error": "缺少文本"}), 400
     tagger = get_tagger()
     tokens = [[w, t] for w, t in tagger.tag(text)]
     result = {"tokens": tokens, "tag_names": TAG_NAMES}
-    rid = _store_result("pos", text, result, corpus_id=cid)
+    rid = _store_result("pos", text, result, corpus_id=cid, text_version=ver)
     result["id"] = rid
+    result["text_version"] = ver
     return jsonify(result)
 
 
@@ -234,7 +508,7 @@ def pos_tag():
 @api.post("/parse")
 def parse():
     data = _payload()
-    text, cid = _resolve_text(data)
+    text, cid, ver = _resolve_text(data)
     if not text:
         return jsonify({"error": "缺少文本"}), 400
     dep = get_parser().parse(text)
@@ -245,8 +519,9 @@ def parse():
         "dep_rel_names": DEP_REL_NAMES,
         "phrase_names": PHRASE_NAMES,
     }
-    rid = _store_result("parse", text, result, corpus_id=cid)
+    rid = _store_result("parse", text, result, corpus_id=cid, text_version=ver)
     result["id"] = rid
+    result["text_version"] = ver
     return jsonify(result)
 
 
@@ -257,13 +532,14 @@ def parse():
 @api.post("/ner")
 def ner():
     data = _payload()
-    text, cid = _resolve_text(data)
+    text, cid, ver = _resolve_text(data)
     if not text:
         return jsonify({"error": "缺少文本"}), 400
     entities = get_ner().recognize(text)
     result = {"entities": entities, "entity_type_names": ENTITY_TYPE_NAMES}
-    rid = _store_result("ner", text, result, corpus_id=cid)
+    rid = _store_result("ner", text, result, corpus_id=cid, text_version=ver)
     result["id"] = rid
+    result["text_version"] = ver
     return jsonify(result)
 
 
@@ -296,13 +572,15 @@ def ner_annotations():
 @api.post("/sentiment")
 def sentiment():
     data = _payload()
-    text, cid = _resolve_text(data)
+    text, cid, ver = _resolve_text(data)
     if not text:
         return jsonify({"error": "缺少文本"}), 400
     result = get_sentiment().analyze(text)
     result["polarity_name"] = POLARITY_NAMES.get(result["polarity"], "")
-    rid = _store_result("sentiment", text, result, corpus_id=cid)
+    rid = _store_result("sentiment", text, result, corpus_id=cid,
+                        text_version=ver)
     result["id"] = rid
+    result["text_version"] = ver
     return jsonify(result)
 
 
@@ -313,14 +591,16 @@ def sentiment():
 @api.post("/summary")
 def summary():
     data = _payload()
-    text, cid = _resolve_text(data)
+    text, cid, ver = _resolve_text(data)
     if not text:
         return jsonify({"error": "缺少文本"}), 400
     result = get_summarizer().summarize(
         text, ratio=data.get("ratio", 0.3),
         max_sentences=data.get("max_sentences"))
-    rid = _store_result("summary", text, result, corpus_id=cid)
+    rid = _store_result("summary", text, result, corpus_id=cid,
+                        text_version=ver)
     result["id"] = rid
+    result["text_version"] = ver
     return jsonify(result)
 
 
@@ -331,12 +611,14 @@ def summary():
 @api.post("/translate")
 def translate():
     data = _payload()
-    text, cid = _resolve_text(data)
+    text, cid, ver = _resolve_text(data)
     if not text:
         return jsonify({"error": "缺少文本"}), 400
     result = get_translator().translate(text, direction=data.get("direction", "zh2en"))
-    rid = _store_result("translate", text, result, corpus_id=cid)
+    rid = _store_result("translate", text, result, corpus_id=cid,
+                        text_version=ver)
     result["id"] = rid
+    result["text_version"] = ver
     return jsonify(result)
 
 
@@ -347,13 +629,15 @@ def translate():
 @api.post("/keywords")
 def keywords():
     data = _payload()
-    text, cid = _resolve_text(data)
+    text, cid, ver = _resolve_text(data)
     if not text:
         return jsonify({"error": "缺少文本"}), 400
     result = get_keywords().extract(text, top_k=data.get("top_k", 10),
                                     method=data.get("method", "hybrid"))
-    rid = _store_result("keywords", text, result, corpus_id=cid)
+    rid = _store_result("keywords", text, result, corpus_id=cid,
+                        text_version=ver)
     result["id"] = rid
+    result["text_version"] = ver
     return jsonify(result)
 
 

@@ -41,13 +41,19 @@
 <script>
 renderNav("segment.html");
 
+// 从校对页跳转而来时自动加载该语料（含文本版本），保证结果与所改版本对得上
+const _params = new URLSearchParams(location.search);
+const _corpusId = _params.get("corpus");
+let _textVersion = _params.get("v");
+
 // 加载语料到下拉框
-async function loadCorpusOptions() {
+async function loadCorpusOptions(selectId) {
   try {
     const data = await api("/api/corpus");
-    const sel = $("#corpus-sel");
+    const sel = $(selectId);
     sel.innerHTML = '<option value="">— 从语料库选择 —</option>' +
       data.corpora.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");
+    if (_corpusId) sel.value = _corpusId;
   } catch (_) {}
 }
 $("#corpus-sel").addEventListener("change", async (e) => {
@@ -55,7 +61,20 @@ $("#corpus-sel").addEventListener("change", async (e) => {
   if (!id) return;
   const r = await api(`/api/corpus/${id}`);
   $("#text").value = r.text;
+  _textVersion = r.version || 1;
 });
+
+async function maybeLoadFromQuery() {
+  if (!_corpusId) return;
+  try {
+    const r = await api(`/api/corpus/${_corpusId}`);
+    $("#text").value = r.text;
+    _textVersion = r.version || 1;
+    if (_params.get("run") === "1") doSegment();
+  } catch (_) {}
+}
+loadCorpusOptions("#corpus-sel");
+maybeLoadFromQuery();
 
 function legend() {
   $("#legend").innerHTML =
@@ -69,10 +88,12 @@ async function doSegment() {
   const btn = $("#btn-seg");
   setLoading(btn, true, "分词中…");
   try {
-    const r = await api("/api/segment", { method: "POST", body: { text } });
+    const r = await api("/api/segment", { method: "POST",
+      body: { text, corpus_id: _corpusId || $("#corpus-sel").value || undefined,
+              text_version: _textVersion ? Number(_textVersion) : undefined } });
     $("#out-title").textContent = `分词结果（共 ${r.count} 词）`;
     $("#output").innerHTML = r.words.map(w => `<span class="token"><span class="t-word">${esc(w)}</span></span>`).join("");
-    $("#stat").textContent = `已保存结果 #${r.id}`;
+    $("#stat").textContent = `已保存结果 #${r.id}${r.text_version ? " · 文本 v" + r.text_version : ""}`;
     legend();
   } catch (e) { toast(e.message, "err"); }
   setLoading(btn, false);
@@ -84,10 +105,12 @@ async function doPos() {
   const btn = $("#btn-pos");
   setLoading(btn, true, "标注中…");
   try {
-    const r = await api("/api/pos", { method: "POST", body: { text } });
+    const r = await api("/api/pos", { method: "POST",
+      body: { text, corpus_id: _corpusId || $("#corpus-sel").value || undefined,
+              text_version: _textVersion ? Number(_textVersion) : undefined } });
     $("#out-title").textContent = `词性标注结果（共 ${r.tokens.length} 词）`;
     $("#output").innerHTML = renderTokens(r.tokens);
-    $("#stat").textContent = `已保存结果 #${r.id}`;
+    $("#stat").textContent = `已保存结果 #${r.id}${r.text_version ? " · 文本 v" + r.text_version : ""}`;
     legend();
   } catch (e) { toast(e.message, "err"); }
   setLoading(btn, false);
@@ -96,7 +119,6 @@ async function doPos() {
 $("#btn-seg").addEventListener("click", doSegment);
 $("#btn-pos").addEventListener("click", doPos);
 
-loadCorpusOptions();
 legend();
 </script>
 </body>

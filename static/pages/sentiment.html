@@ -25,9 +25,10 @@
     <p class="page-desc">情感词典打分（程度副词加权 + 否定翻转）与朴素贝叶斯分类结合。</p>
 
     <section class="card">
-      <label>输入文本</label>
+      <label>输入文本（可选择已校对的语料）</label>
       <textarea id="text">这个产品非常好用，性能强劲，我很喜欢；不过价格有点贵。</textarea>
-      <div class="toolbar mt">
+      <div class="row mt">
+        <select id="corpus-sel" style="max-width:280px"><option value="">— 从语料库选择 —</option></select>
         <button class="btn" id="btn-analyze">情感分析</button>
       </div>
     </section>
@@ -65,6 +66,28 @@ renderNav("sentiment.html");
 
 const POL = { positive: "积极", negative: "消极", neutral: "中性" };
 
+const _params = new URLSearchParams(location.search);
+const _corpusId = _params.get("corpus");
+let _textVersion = _params.get("v");
+(async function initCorpus() {
+  try {
+    const data = await api("/api/corpus");
+    $("#corpus-sel").innerHTML = '<option value="">— 从语料库选择 —</option>' +
+      data.corpora.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");
+    if (_corpusId) {
+      $("#corpus-sel").value = _corpusId;
+      const r = await api(`/api/corpus/${_corpusId}`);
+      $("#text").value = r.text; _textVersion = r.version || 1;
+      if (_params.get("run") === "1") doAnalyze();
+    }
+  } catch (_) {}
+})();
+$("#corpus-sel").addEventListener("change", async (e) => {
+  if (!e.target.value) return;
+  const r = await api(`/api/corpus/${e.target.value}`);
+  $("#text").value = r.text; _textVersion = r.version || 1;
+});
+
 function highlightSentiment(text, posWords, negWords) {
   const seg = posWords.concat(negWords);
   if (!seg.length) return esc(text);
@@ -101,9 +124,11 @@ async function doAnalyze() {
   const btn = $("#btn-analyze");
   setLoading(btn, true, "分析中…");
   try {
-    const r = await api("/api/sentiment", { method: "POST", body: { text } });
+    const r = await api("/api/sentiment", { method: "POST",
+      body: { text, corpus_id: _corpusId || $("#corpus-sel").value || undefined,
+              text_version: _textVersion ? Number(_textVersion) : undefined } });
     const pol = r.polarity;
-    $("#polarity").textContent = `${POL[pol] || pol} · ${r.score >= 0 ? "+" : ""}${r.score}`;
+    $("#polarity").textContent = `${POL[pol] || pol} · ${r.score >= 0 ? "+" : ""}${r.score}${r.text_version ? "（文本 v" + r.text_version + "）" : ""}`;
     $("#polarity").className = "polarity p-" + pol;
     // 量表：score in [-1,1] -> 0..100
     const pct = Math.round((r.score + 1) / 2 * 100);

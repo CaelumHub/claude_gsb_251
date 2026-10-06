@@ -4,6 +4,7 @@
 
 const PAGES = [
   { file: "corpus.html",    name: "语料库管理",   desc: "上传与清洗" },
+  { file: "proofread.html", name: "文本校对",     desc: "错别字/标点" },
   { file: "segment.html",   name: "分词与词性标注", desc: "切词 + POS" },
   { file: "parse.html",     name: "句法分析树",   desc: "依存 / 成分树" },
   { file: "ner.html",       name: "命名实体识别", desc: "NER 与标注" },
@@ -16,11 +17,19 @@ const PAGES = [
 ];
 
 const PAGE_NAMES = {
-  corpus: "语料库管理", segment: "分词与词性标注", parse: "句法分析树",
+  corpus: "语料库管理", proofread: "文本校对", segment: "分词与词性标注", parse: "句法分析树",
   ner: "命名实体识别", sentiment: "情感分析", summary: "文本摘要",
   translate: "机器翻译", keywords: "关键词提取", embedding: "词向量可视化",
   pipeline: "流水线配置与执行",
 };
+
+// 校对类别 / 严重度展示名（与后端 nlp/proof_data.py 一致）
+const PROOF_CATEGORY_NAMES = {
+  homophone: "同音字", shape: "形近字", word: "错词/成语",
+  duplicate: "多字", missing: "疑似漏字",
+  punct_pair: "引号/括号不闭合", punct_misuse: "标点误用",
+};
+const PROOF_SEVERITY_NAMES = { high: "高", medium: "中", low: "疑似" };
 
 // 中文标签集（与后端 /api/meta 一致，离线可用）
 const TAG_NAMES = {
@@ -145,4 +154,56 @@ function renderPageTitle(key, desc) {
   if (t && PAGE_NAMES[key]) t.textContent = PAGE_NAMES[key];
   const d = $(".page-desc");
   if (d && desc) d.textContent = desc;
+}
+
+/* ============================================================
+   文本校对：高亮渲染、语料选择器、按版本加载
+   ============================================================ */
+
+/* 把带 finding 偏移的文本渲染成逐处高亮的 HTML */
+function renderProofText(text, findings, opts = {}) {
+  const ignored = new Set(opts.ignored || []);
+  const active = new Set(opts.activeIds || []);
+  if (!findings || !findings.length) return esc(text);
+  const sorted = findings.slice().sort((a, b) => a.start - b.start || b.end - a.end);
+  let html = "", last = 0;
+  const occupied = [];
+  for (const f of sorted) {
+    // 同一区间只渲染优先级最高的一条
+    if (occupied.some(([s, e]) => f.start < e && s < f.end)) continue;
+    occupied.push([f.start, f.end]);
+    if (f.start > last) html += esc(text.slice(last, f.start));
+    const cls = ignored.has(f.id) ? "pf-ignored"
+      : active.has(f.id) ? `pf-highlight pf-${f.severity} pf-active`
+      : `pf-highlight pf-${f.severity}`;
+    const shown = f.end > f.start ? esc(text.slice(f.start, f.end))
+      : `<span class="pf-caret">^</span>`;
+    const title = `${PROOF_CATEGORY_NAMES[f.category] || f.category}｜${f.reason}`;
+    html += `<span class="${cls}" data-fid="${esc(f.id)}" title="${esc(title)}">${shown}</span>`;
+    last = f.end;
+  }
+  html += esc(text.slice(last));
+  return html;
+}
+
+/* 绑定语料下拉框：选择后拉取该语料文本（含版本号）回填到 textarea */
+function bindCorpusSelect(selectSel, textSel, onLoaded) {
+  async function load() {
+    try {
+      const data = await api("/api/corpus");
+      const sel = $(selectSel);
+      sel.innerHTML = '<option value="">— 从语料库选择 —</option>' +
+        data.corpora.map(c => `<option value="${esc(c.id)}">${esc(c.name)}（v${c.version || 1}）</option>`).join("");
+    } catch (_) {}
+  }
+  $(selectSel).addEventListener("change", async (e) => {
+    const id = e.target.value;
+    if (!id) return;
+    const r = await api(`/api/corpus/${id}`);
+    $(textSel).value = r.text;
+    $(textSel).dataset.corpusId = id;
+    $(textSel).dataset.version = r.version || 1;
+    if (onLoaded) onLoaded(r);
+  });
+  load();
 }
