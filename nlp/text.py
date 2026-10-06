@@ -6,12 +6,22 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from collections import Counter
 from typing import Iterable
 
 from .lexicon import STOPWORDS
+
+
+def text_hash(text: str) -> str:
+    """文本内容指纹（短 SHA1）。
+
+    用作语料版本标识：校对修改写回后指纹变化，下游任务（分词 / 情感 /
+    摘要等）结果记录同一指纹，即可核对结果对应的是哪一版文本。
+    """
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
 
 _SENT_SPLIT_RE = re.compile(r"[。！？!?；;\n]+|(?<=[.!?])\s+")

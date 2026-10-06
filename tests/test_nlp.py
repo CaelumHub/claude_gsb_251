@@ -19,8 +19,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from nlp import (get_segmenter, get_tagger, get_parser, get_constituency_parser,
                  get_ner, get_sentiment, get_summarizer, get_translator,
-                 get_keywords, get_embeddings, TAGSET)
+                 get_keywords, get_embeddings, get_proofreader, TAGSET)
 from nlp.hmm import HMM
+from nlp.text import text_hash
 from pipeline import PipelineEngine, PipelineError
 from storage import ShardedStore, StoreRegistry
 
@@ -240,6 +241,192 @@ class TestPipeline(unittest.TestCase):
         cfg = {"name": "p", "stages": [{"name": "not_exist"}]}
         with self.assertRaises(PipelineError):
             self.engine.build(cfg)
+
+
+class TestProofread(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.pr = get_proofreader()
+
+    def _rules(self, text, **kw):
+        return [i["rule"] for i in self.pr.scan(text, **kw)]
+
+    def test_homophone_confusion(self):
+        issues = self.pr.scan("我们明天在见吧")
+        conf = [i for i in issues if i["rule"] == "confusion"]
+        self.assertTrue(conf)
+        self.assertEqual(conf[0]["original"], "在")
+        self.assertEqual(conf[0]["candidates"][0]["text"], "再")
+
+    def test_shape_confusion(self):
+        issues = self.pr.scan("他己经走了")
+        conf = [i for i in issues if i["rule"] == "confusion"]
+        self.assertTrue(conf)
+        self.assertEqual(conf[0]["candidates"][0]["text"], "已")
+
+    def test_correct_text_not_flagged(self):
+        # 已经写对的字不应误报
+        issues = self.pr.scan("我们明天再见，他已经回到家了。")
+        conf = [i for i in issues if i["rule"] == "confusion"]
+        self.assertFalse(conf)
+
+    def test_confusion_no_oscillation(self):
+        # 「自已经」中 自己/已经 都是强词：只能标为低置信存疑，
+        # 不允许给出会被一键应用的高置信改法，避免改了又改回的震荡
+        issues = self.pr.scan("他自已经回到了北京")
+        conf = [i for i in issues if i["rule"] == "confusion"]
+        for it in conf:
+            self.assertLess(it["candidates"][0]["confidence"], 0.8)
+
+    def test_reduplication(self):
+        issues = self.pr.scan("他的的书包很很好看")
+        redup = [i for i in issues if i["rule"] == "reduplication"]
+        self.assertTrue(any(i["original"] == "的的" for i in redup))
+        # 「很很好看」中的「很很」是虚词叠用，也应报
+        self.assertTrue(any(i["original"] == "很很" for i in redup))
+
+    def test_reduplication_whitelist(self):
+        # 合法叠词不报
+        redup = self._rules("他慢慢走，看看天上的星星。")
+        self.assertNotIn("reduplication", redup)
+
+    def test_missing_char_idiom(self):
+        issues = self.pr.scan("我们要再接再，争取胜利")
+        miss = [i for i in issues if i["rule"] == "missing_char"]
+        self.assertTrue(miss)
+        self.assertEqual(miss[0]["candidates"][0]["text"], "厉")
+
+    def test_complete_idiom_not_flagged(self):
+        rules = self._rules("他做事一如既往，再接再厉。")
+        self.assertNotIn("missing_char", rules)
+
+    def test_punct_unclosed(self):
+        issues = self.pr.scan("他说“你好")
+        unclosed = [i for i in issues if i["rule"] == "punct_unclosed"]
+        self.assertTrue(unclosed)
+
+    def test_punct_redundant_close(self):
+        issues = self.pr.scan("你好》世界")
+        self.assertIn("punct_redundant", [i["rule"] for i in issues])
+
+    def test_punct_balanced_not_flagged(self):
+        rules = self._rules("他说：“你好。”《红楼梦》很好看。（是的）")
+        self.assertNotIn("punct_unclosed", rules)
+        self.assertNotIn("punct_redundant", rules)
+
+    def test_halfwidth_punct(self):
+        issues = self.pr.scan("你好,世界!")
+        half = [i for i in issues if i["rule"] == "punct_halfwidth"]
+        self.assertEqual(len(half), 2)
+        self.assertEqual(half[0]["candidates"][0]["text"], "，")
+
+    def test_ner_protection(self):
+        # 专名（人名/地名）区间不参与字词检查
+        issues = self.pr.scan("马云在北京工作")
+        self.assertFalse(issues)
+
+    def test_protected_words(self):
+        text = "我们明天在见吧"
+        normal = self.pr.scan(text)
+        self.assertTrue(normal)
+        guarded = self.pr.scan(text, protected_words=["在见"])
+        conf = [i for i in guarded if i["rule"] == "confusion"]
+        self.assertFalse(conf)
+
+    def test_ignores(self):
+        text = "我们明天在见吧"
+        ignores = [("confusion", "在", "再")]
+        issues = self.pr.scan(text, ignores=ignores)
+        conf = [i for i in issues if i["rule"] == "confusion"]
+        self.assertFalse(conf)
+
+    def test_apply_fixes_multiple(self):
+        text = "我们明天在见，他己经到了"
+        issues = self.pr.scan(text)
+        fixes = [i["candidates"][0]["fix"] for i in issues
+                 if i["rule"] == "confusion"]
+        self.assertEqual(len(fixes), 2)
+        out = self.pr.apply_fixes(text, fixes)
+        self.assertEqual(out["text"], "我们明天再见，他已经到了")
+        self.assertEqual(len(out["applied"]), 2)
+        self.assertFalse(out["conflicts"])
+
+    def test_apply_insert_and_delete(self):
+        # 插入（漏字）与删除（多字）混合应用
+        text = "再接再，他的的书"
+        fixes = [
+            {"start": 3, "end": 3, "original": "", "replacement": "厉"},
+            {"start": 5, "end": 7, "original": "的的", "replacement": "的"},
+        ]
+        out = self.pr.apply_fixes(text, fixes)
+        self.assertEqual(out["text"], "再接再厉，他的书")
+
+    def test_apply_conflict_detected(self):
+        text = "我们明天在见"
+        bad = [{"start": 4, "end": 5, "original": "天", "replacement": "再"}]
+        out = self.pr.apply_fixes(text, bad)
+        self.assertFalse(out["applied"])
+        self.assertEqual(len(out["conflicts"]), 1)
+        self.assertEqual(out["text"], text)
+
+    def test_apply_overlap_detected(self):
+        text = "abcdef"
+        fixes = [
+            {"start": 1, "end": 3, "original": "bc", "replacement": "X"},
+            {"start": 2, "end": 4, "original": "cd", "replacement": "Y"},
+        ]
+        out = self.pr.apply_fixes(text, fixes)
+        self.assertEqual(len(out["applied"]), 1)
+        self.assertEqual(len(out["conflicts"]), 1)
+
+    def test_text_hash_changes(self):
+        h1 = text_hash("原文")
+        h2 = text_hash("原文")
+        h3 = text_hash("原文。")
+        self.assertEqual(h1, h2)
+        self.assertNotEqual(h1, h3)
+
+
+class TestProofreadPipeline(unittest.TestCase):
+    def test_proofread_stage_feeds_segment(self):
+        engine = PipelineEngine().register_builtin()
+        cfg = {"name": "pf", "stages": [
+            {"name": "proofread"}, {"name": "segment"}]}
+        out = engine.build(cfg).run({"text": "我们明天在见吧"})
+        self.assertIn("proofread_issues", out)
+        # 高置信修正写入 clean_text，分词用的是修正后的文本
+        self.assertIn("clean_text", out)
+        self.assertIn("再见", out["clean_text"])
+        self.assertIn("再见", out["words"])
+
+    def test_proofread_stage_no_auto_apply(self):
+        engine = PipelineEngine().register_builtin()
+        cfg = {"name": "pf", "stages": [
+            {"name": "proofread", "params": {"auto_apply": False}}]}
+        out = engine.build(cfg).run({"text": "我们明天在见吧"})
+        self.assertIn("proofread_issues", out)
+        self.assertNotIn("clean_text", out)
+
+
+class TestStoreUpdate(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_update_merges_and_keeps_id(self):
+        store = ShardedStore(self.tmp, "t", shard_size=10)
+        rid = store.insert({"text": "旧文本", "v": 1})
+        ok = store.update(rid, {"text": "新文本", "revisions": [{"rev": 1}]})
+        self.assertTrue(ok)
+        rec = store.get(rid)
+        self.assertEqual(rec["id"], rid)
+        self.assertEqual(rec["text"], "新文本")
+        self.assertEqual(rec["v"], 1)  # 未涉及的字段保留
+        self.assertEqual(rec["revisions"], [{"rev": 1}])
+        # 更新不存在的 id
+        self.assertFalse(store.update("nope", {"x": 1}))
 
 
 if __name__ == "__main__":

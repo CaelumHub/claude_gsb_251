@@ -288,6 +288,40 @@ table.data tr:hover td { background: var(--surface-2); }
 /* 语料预览 */
 .preview { font-size: 13px; color: var(--text-muted); white-space: pre-wrap; max-height: 160px; overflow: auto; }
 
+/* ---------- 语料校对 ---------- */
+.pf-text {
+  font-size: 16px; line-height: 2.1; white-space: pre-wrap;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 9px; padding: 14px 16px; max-height: 320px; overflow: auto;
+}
+.pf-issue {
+  border-bottom: 2px solid; border-radius: 3px; padding: 0 1px;
+  cursor: pointer; transition: filter .15s;
+}
+.pf-issue:hover { filter: brightness(.92); }
+.pf-issue.active { outline: 2px solid var(--primary); outline-offset: 1px; }
+.pf-confusion        { background: #fee2e2; border-color: #dc2626; }
+.pf-de_particle      { background: #fce7f3; border-color: #db2777; }
+.pf-reduplication    { background: #fef3c7; border-color: #d97706; }
+.pf-missing_char     { background: #dbeafe; border-color: #2563eb; }
+.pf-punct_unclosed,
+.pf-punct_redundant,
+.pf-punct_halfwidth  { background: #ede9fe; border-color: #7c3aed; }
+
+.pf-progress {
+  height: 10px; border-radius: 999px; background: #e5e7eb; overflow: hidden;
+}
+.pf-progress .fill { height: 100%; background: var(--primary); transition: width .3s; }
+
+.pf-issue-item { border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; }
+.pf-issue-item .fix-select { max-width: 220px; display: inline-block; width: auto; }
+.pf-conf { font-family: var(--mono); font-size: 12px; color: var(--text-muted); }
+
+/* 语料多选列表 */
+.check-list { max-height: 220px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+.check-list label { display: flex; gap: 8px; align-items: center; margin: 4px 0; color: var(--text); font-weight: 400; }
+.check-list input[type=checkbox] { width: auto; }
+
 /* 句法树 */
 .tree-wrap { overflow: auto; }
 .tree-node { display: inline-block; text-align: center; }

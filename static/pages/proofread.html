@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>语料校对 - NLP 流水线平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">语料校对</h1>
+    <p class="page-desc">自动扫描错别字（同音 / 形近）、多字漏字与标点误用；逐处高亮、一键应用或忽略，
+      修改写回语料后可立即送入分词、情感、摘要等任务继续处理。</p>
+
+    <!-- ① 批量扫描 -->
+    <section class="card">
+      <h2>① 批量扫描</h2>
+      <label>选择语料（不勾选任何一项则扫描全部）</label>
+      <div class="check-list" id="corpus-checks"><div class="muted">加载中…</div></div>
+      <div class="toolbar mt">
+        <button class="btn" id="btn-scan">开始扫描</button>
+        <span class="muted small" id="scan-status"></span>
+      </div>
+      <div class="pf-progress mt" id="scan-progress" style="display:none">
+        <div class="fill" style="width:0%"></div>
+      </div>
+    </section>
+
+    <!-- ② 扫描结果 -->
+    <section class="card">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">② 扫描结果</h2>
+        <button class="btn secondary small" id="btn-refresh-results">刷新</button>
+      </div>
+      <div id="scan-results"><div class="muted">尚未扫描。</div></div>
+    </section>
+
+    <!-- ③ 逐处审阅 -->
+    <section class="card" id="review-card" style="display:none">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">③ 逐处审阅：<span id="review-name"></span></h2>
+        <span class="badge blue small" id="review-hash" title="当前文本指纹"></span>
+        <button class="btn small" id="btn-apply-all">应用全部高置信（≥0.8）</button>
+      </div>
+      <div class="pf-text" id="review-text"></div>
+      <h3 class="mt">疑似问题（<span id="issue-count">0</span> 处）</h3>
+      <div class="list" id="issue-list"></div>
+    </section>
+
+    <!-- ④ 修订历史与下游验证 -->
+    <section class="card" id="revision-card" style="display:none">
+      <h2>④ 修订历史与下游任务验证</h2>
+      <div id="revision-list"><div class="muted">暂无修订。</div></div>
+      <div class="toolbar mt">
+        <span class="muted small">用当前文本重新运行：</span>
+        <button class="btn secondary small" data-task="segment">分词</button>
+        <button class="btn secondary small" data-task="sentiment">情感分析</button>
+        <button class="btn secondary small" data-task="summary">摘要</button>
+      </div>
+      <div id="downstream-result" class="mt"></div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("proofread.html");
+
+let review = null;  // {corpusId, name, text, textHash, issues}
+
+/* ---------- ① 批量扫描 ---------- */
+async function loadCorpusChecks() {
+  try {
+    const data = await api("/api/corpus");
+    const host = $("#corpus-checks");
+    if (!data.corpora.length) {
+      host.innerHTML = '<div class="muted">暂无语料，请先到「语料库管理」上传。</div>';
+      return;
+    }
+    host.innerHTML = data.corpora.map(c => `
+      <label><input type="checkbox" value="${esc(c.id)}">
+        ${esc(c.name)} <span class="muted small">(${c.length} 字)</span></label>`).join("");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function startScan() {
+  const ids = $$("#corpus-checks input:checked").map(i => i.value);
+  const btn = $("#btn-scan");
+  setLoading(btn, true, "扫描中…");
+  try {
+    const r = await api("/api/proofread/scan", {
+      method: "POST", body: ids.length ? { corpus_ids: ids } : {},
+    });
+    pollScan(r.scan_id, btn);
+  } catch (e) { toast(e.message, "err"); setLoading(btn, false); }
+}
+
+function pollScan(scanId, btn) {
+  $("#scan-progress").style.display = "block";
+  const timer = setInterval(async () => {
+    try {
+      const s = await api(`/api/proofread/scan/${scanId}`);
+      const pct = s.total ? Math.round(s.done / s.total * 100) : 0;
+      $("#scan-progress .fill").style.width = pct + "%";
+      $("#scan-status").textContent = `扫描中 ${s.done}/${s.total}（成功 ${s.ok}，失败 ${s.failed}）`;
+      if (s.finished) {
+        clearInterval(timer);
+        setLoading(btn, false);
+        $("#scan-status").textContent =
+          `完成：共 ${s.total} 篇，成功 ${s.ok} 篇，失败 ${s.failed} 篇`;
+        loadResults();
+      }
+    } catch (e) {
+      clearInterval(timer);
+      setLoading(btn, false);
+      toast(e.message, "err");
+    }
+  }, 700);
+}
+
+/* ---------- ② 扫描结果 ---------- */
+async function loadResults() {
+  try {
+    const data = await api("/api/proofread/results");
+    const host = $("#scan-results");
+    if (!data.results.length) {
+      host.innerHTML = '<div class="muted">暂无扫描结果。</div>';
+      return;
+    }
+    host.innerHTML = `<table class="data"><thead><tr>
+      <th>语料</th><th>状态</th><th>疑似问题</th><th>耗时</th><th>扫描时间</th><th></th>
+      </tr></thead><tbody>${data.results.map(r => `
+      <tr>
+        <td>${esc(r.corpus_name)} <span class="muted small">${r.text_length} 字</span></td>
+        <td>${r.status === "ok"
+          ? '<span class="badge green">成功</span>'
+          : `<span class="badge red" title="${esc(r.error || "")}">失败</span>`}</td>
+        <td>${r.status === "ok" ? `<span class="badge ${r.issue_count ? "amber" : ""}">${r.issue_count} 处</span>` : "—"}</td>
+        <td class="muted small">${r.duration_ms} ms</td>
+        <td class="muted small">${fmtTime(r.created_at)}</td>
+        <td>${r.status === "ok"
+          ? `<button class="btn secondary small" data-cid="${esc(r.corpus_id)}" data-name="${esc(r.corpus_name)}" onclick="reviewCorpus(this.dataset.cid, this.dataset.name)">审阅</button>`
+          : ""}</td>
+      </tr>`).join("")}</tbody></table>`;
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/* ---------- ③ 逐处审阅 ---------- */
+async function reviewCorpus(corpusId, name) {
+  try {
+    const c = await api(`/api/corpus/${corpusId}`);
+    // 总是基于当前文本重新检查，保证偏移与文本一致
+    const chk = await api("/api/proofread/check", {
+      method: "POST", body: { corpus_id: corpusId },
+    });
+    review = { corpusId, name, text: c.text, textHash: chk.text_hash, issues: chk.issues };
+    renderReview();
+    loadRevisions();
+    $("#review-card").style.display = "block";
+    $("#revision-card").style.display = "block";
+    $("#review-card").scrollIntoView({ behavior: "smooth" });
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function renderReview() {
+  review.issues.forEach((it, i) => { it._idx = i; });
+  $("#review-name").textContent = review.name;
+  $("#review-hash").textContent = "文本指纹 " + review.textHash;
+  $("#issue-count").textContent = review.issues.length;
+
+  // 高亮文本
+  const sorted = review.issues.slice().sort((a, b) => a.start - b.start || a.end - b.end);
+  let html = "", last = 0;
+  for (const it of sorted) {
+    if (it.start < last) continue;
+    html += esc(review.text.slice(last, it.start));
+    const mark = it.start === it.end ? "∧" : review.text.slice(it.start, it.end);
+    html += `<span class="pf-issue pf-${it.rule}" data-idx="${it._idx}"
+      title="${esc(it.message)}" onclick="focusIssue(${it._idx})">${esc(mark)}</span>`;
+    last = it.end;
+  }
+  html += esc(review.text.slice(last));
+  $("#review-text").innerHTML = html;
+
+  // 问题列表
+  const host = $("#issue-list");
+  if (!review.issues.length) {
+    host.innerHTML = '<div class="muted">未发现疑似问题。</div>';
+    return;
+  }
+  host.innerHTML = review.issues.map(it => {
+    const opts = it.candidates.map((c, i) =>
+      `<option value="${i}">${esc(it.original || "（空）")} → ${esc(c.text)}（${c.confidence}）</option>`).join("");
+    const top = it.candidates[0] || { confidence: 0, reason: "" };
+    return `<div class="pf-issue-item" id="issue-${it._idx}">
+      <div class="row" style="align-items:center">
+        <span class="badge ${it.rule.startsWith("punct") ? "blue" : "red"}">${esc(it.rule_name)}</span>
+        <span style="flex:1">${esc(it.message)}</span>
+        <span class="pf-conf">置信度 ${top.confidence}</span>
+      </div>
+      <div class="muted small mt">上下文：…${esc(it.context)}…</div>
+      <div class="row mt" style="align-items:center">
+        <select class="fix-select" id="fix-${it._idx}">${opts}</select>
+        <button class="btn small" onclick="applyIssue(${it._idx})">应用</button>
+        <button class="btn secondary small" onclick="ignoreIssue(${it._idx})">忽略</button>
+        <span class="muted small">${esc(top.reason)}</span>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function focusIssue(idx) {
+  const el = $(`#issue-${idx}`);
+  if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.style.outline = "2px solid var(--primary)";
+  setTimeout(() => { el.style.outline = ""; }, 1600);
+}
+
+async function applyIssue(idx) {
+  const it = review.issues[idx];
+  const sel = $(`#fix-${idx}`);
+  const cand = it.candidates[sel.selectedIndex];
+  if (!cand) return;
+  await applyFixes([cand.fix]);
+}
+
+async function applyAll() {
+  if (!review) return;
+  const items = review.issues
+    .filter(it => it.candidates[0] && it.candidates[0].confidence >= 0.8)
+    .map(it => it.candidates[0].fix);
+  if (!items.length) return toast("没有置信度 ≥0.8 的修改", "err");
+  await applyFixes(items);
+}
+
+async function applyFixes(items) {
+  try {
+    const r = await api(`/api/corpus/${review.corpusId}/proofread/apply`, {
+      method: "POST",
+      body: { base_hash: review.textHash, items },
+    });
+    toast(`已应用 ${r.applied} 处修改` +
+      (r.conflicts.length ? `，${r.conflicts.length} 处冲突被跳过` : ""),
+      r.conflicts.length ? "err" : "ok");
+    await refreshReview();
+  } catch (e) {
+    toast(e.message, "err");
+    await refreshReview();  // 版本冲突等情况下刷新到最新状态
+  }
+}
+
+async function ignoreIssue(idx) {
+  const it = review.issues[idx];
+  const top = it.candidates[0];
+  try {
+    await api("/api/proofread/ignore", {
+      method: "POST",
+      body: {
+        rule: it.rule, original: it.original,
+        replacement: top ? top.fix.replacement : "",
+        context: it.context,
+        corpus_id: review.corpusId,
+      },
+    });
+    toast("已加入忽略列表，之后扫描不再提示");
+    await refreshReview();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function refreshReview() {
+  if (!review) return;
+  const c = await api(`/api/corpus/${review.corpusId}`);
+  const chk = await api("/api/proofread/check", {
+    method: "POST", body: { corpus_id: review.corpusId },
+  });
+  review.text = c.text;
+  review.textHash = chk.text_hash;
+  review.issues = chk.issues;
+  renderReview();
+  loadRevisions();
+  loadResults();
+}
+
+/* ---------- ④ 修订历史与下游验证 ---------- */
+async function loadRevisions() {
+  if (!review) return;
+  try {
+    const r = await api(`/api/corpus/${review.corpusId}/revisions`);
+    const host = $("#revision-list");
+    if (!r.revisions.length) {
+      host.innerHTML = '<div class="muted">暂无修订。</div>';
+      return;
+    }
+    host.innerHTML = r.revisions.slice().reverse().map(rev => `
+      <div class="list-item">
+        <div class="meta">
+          <div class="name">修订 #${rev.rev}
+            <span class="badge blue small">${rev.items.length} 处修改</span>
+            ${rev.conflicts.length ? `<span class="badge red small">${rev.conflicts.length} 处冲突</span>` : ""}
+          </div>
+          <div class="sub">${fmtTime(rev.applied_at)} · 指纹 ${rev.hash_before} → ${rev.hash_after}</div>
+          <div class="sub mt">${rev.items.map(it =>
+            `「${esc(it.original || "∅")}」→「${esc(it.replacement || "∅")}」@${it.start}`
+          ).join("；")}</div>
+        </div>
+      </div>`).join("");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function runDownstream(task) {
+  if (!review) return;
+  const host = $("#downstream-result");
+  host.innerHTML = '<div class="muted">处理中…</div>';
+  try {
+    const r = await api(`/api/${task}`, {
+      method: "POST", body: { corpus_id: review.corpusId },
+    });
+    // 对账：查该任务最新一条结果记录的文本指纹，与当前语料指纹比对
+    const q = await api(`/api/results/${task}?corpus_id=${review.corpusId}` +
+      `&order_by=created_at&order=desc&limit=1`);
+    const rec = (q.records || [])[0];
+    const match = rec && rec.text_hash === review.textHash;
+    const badge = match
+      ? '<span class="badge green">✓ 结果与当前语料版本一致</span>'
+      : '<span class="badge red">✗ 结果版本与当前语料不一致</span>';
+
+    let summary = "";
+    if (task === "segment") {
+      summary = `<strong>分词（${r.count} 词）：</strong><div class="output">${esc(r.words.slice(0, 80).join(" / "))}${r.count > 80 ? " …" : ""}</div>`;
+    } else if (task === "sentiment") {
+      summary = `<strong>情感：</strong>${esc(r.polarity_name)} · 得分 ${r.score}`;
+    } else if (task === "summary") {
+      summary = `<strong>摘要：</strong><div class="output">${esc(r.summary)}</div>`;
+    }
+    host.innerHTML = `<div class="mb">${badge}
+      <span class="muted small">结果指纹 ${rec ? rec.text_hash : "—"} / 当前语料指纹 ${review.textHash}</span></div>
+      ${summary}`;
+  } catch (e) {
+    host.innerHTML = "";
+    toast(e.message, "err");
+  }
+}
+
+/* ---------- 事件绑定 ---------- */
+$("#btn-scan").addEventListener("click", startScan);
+$("#btn-refresh-results").addEventListener("click", loadResults);
+$("#btn-apply-all").addEventListener("click", applyAll);
+$$("#revision-card [data-task]").forEach(btn =>
+  btn.addEventListener("click", () => runDownstream(btn.dataset.task)));
+
+loadCorpusChecks();
+loadResults();
+</script>
+</body>
+</html>

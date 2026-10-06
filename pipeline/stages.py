@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from nlp import (get_keywords, get_ner, get_parser, get_segmenter,
                  get_sentiment, get_summarizer, get_tagger, get_translator,
-                 get_constituency_parser)
+                 get_constituency_parser, get_proofreader)
 from nlp.lexicon import STOPWORDS
 
 from .stage import Stage
@@ -70,9 +70,34 @@ def _parse(ctx, params):
     return {"parse": {"dependency": dep, "constituency": const}}
 
 
+def _proofread(ctx, params):
+    """文本校对：产出疑似问题列表；可选把高置信度修正写入 clean_text，
+    使后续阶段（分词 / 情感 / 摘要等）自动使用修正后的文本。"""
+    text = ctx.get("text", "")
+    pr = get_proofreader()
+    issues = pr.scan(text)
+    out = {"proofread_issues": issues}
+    if params.get("auto_apply", True):
+        threshold = params.get("min_confidence", 0.8)
+        fixes = []
+        for issue in issues:
+            if not issue["candidates"]:
+                continue
+            top = issue["candidates"][0]
+            if top["confidence"] >= threshold:
+                fixes.append(top["fix"])
+        if fixes:
+            out["clean_text"] = pr.apply_fixes(text, fixes)["text"]
+    return out
+
+
 BUILTIN_STAGES = [
     Stage("clean", _clean, inputs=["text"], outputs=["clean_text"],
           description="文本清洗：去空白、去停用词", params={"remove_stopwords": True}),
+    Stage("proofread", _proofread, inputs=["text"],
+          outputs=["clean_text", "proofread_issues"],
+          description="文本校对：错别字/多字漏字/标点检查，高置信修正写入 clean_text",
+          params={"auto_apply": True, "min_confidence": 0.8}),
     Stage("segment", _segment, inputs=["text", "clean_text"], outputs=["words"],
           description="中文分词"),
     Stage("pos", _pos, inputs=["text", "clean_text"], outputs=["pos"],

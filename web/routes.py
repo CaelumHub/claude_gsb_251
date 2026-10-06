@@ -8,17 +8,21 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from flask import Blueprint, current_app, jsonify, request
 
 from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
-                 get_parser, get_segmenter, get_sentiment, get_summarizer,
-                 get_tagger, get_translator, ENTITY_TYPE_NAMES, TAG_NAMES,
-                 DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
+                 get_parser, get_proofreader, get_segmenter, get_sentiment,
+                 get_summarizer, get_tagger, get_translator, ENTITY_TYPE_NAMES,
+                 TAG_NAMES, DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES,
+                 RULE_NAMES)
 from nlp.lexicon import STOPWORDS
+from nlp.text import text_hash
 from storage import StoreRegistry
 
 
@@ -46,7 +50,9 @@ def _models_dir() -> str:
 
 def _store_result(task: str, text: str, result: dict,
                   corpus_id: Optional[str] = None) -> str:
-    record = {"text": text, "result": result, "created_at": time.time()}
+    record = {"text": text, "result": result, "created_at": time.time(),
+              # 文本指纹：下游结果可据此核对对应的是语料的哪一版文本
+              "text_hash": text_hash(text)}
     if corpus_id:
         record["corpus_id"] = corpus_id
     return _registry().task(task).insert(record)
@@ -193,6 +199,307 @@ def clean_corpus(cid: str):
     result = _clean(record.get("text", ""), data.get("remove_stopwords", True))
     _store_result("clean", record.get("text", ""), result, corpus_id=cid)
     return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# 语料校对（错别字 / 多字漏字 / 标点）
+# ---------------------------------------------------------------------------
+
+# 批量扫描在后台线程池执行：单篇失败只标记该篇，不阻塞整批
+_proofread_executor = ThreadPoolExecutor(max_workers=4)
+_proofread_scans: dict[str, dict] = {}
+_proofread_lock = threading.Lock()
+
+
+def _load_ignores(corpus_id: Optional[str] = None) -> list[tuple]:
+    """读取忽略列表，转为 (rule, original, replacement, context) 四元组。
+
+    全局忽略（corpus_id="*"）对所有语料生效，其余按语料过滤。
+    """
+    triples = []
+    for r in _registry().task("proofread_ignore").all():
+        if r.get("_deleted"):
+            continue
+        scope = r.get("corpus_id") or "*"
+        if scope != "*" and scope != corpus_id:
+            continue
+        triples.append((r.get("rule"), r.get("original"),
+                        r.get("replacement"), r.get("context") or ""))
+    return triples
+
+
+def _load_protected_words() -> list[str]:
+    words = []
+    for r in _registry().task("proofread_dict").all():
+        if not r.get("_deleted") and r.get("word"):
+            words.append(r["word"])
+    return words
+
+
+def _scan_one_corpus(registry, proofreader, scan_id, cid, record,
+                     ignores, protected):
+    """扫描单篇语料并落库，返回 (corpus_id, result_id, ok)。
+
+    任何异常都被捕获并记录为 error 结果，保证整批扫描不被单篇拖垮。
+    （在后台线程执行，registry / proofreader 由请求线程解析后传入，
+    避免访问 current_app 应用上下文。）
+    """
+    started = time.time()
+    text = record.get("text", "")
+    base = {
+        "scan_id": scan_id, "corpus_id": cid,
+        "corpus_name": record.get("name", "未命名"),
+        "text_hash": text_hash(text), "text_length": len(text),
+        "created_at": time.time(),
+    }
+    try:
+        issues = proofreader.scan(
+            text, protected_words=protected, ignores=ignores)
+        record_out = {**base, "status": "ok", "issues": issues,
+                      "issue_count": len(issues),
+                      "duration_ms": int((time.time() - started) * 1000)}
+        rid = registry.task("proofread").insert(record_out)
+        return cid, rid, True
+    except Exception as exc:  # noqa: BLE001
+        record_out = {**base, "status": "error",
+                      "error": f"{type(exc).__name__}: {exc}",
+                      "issues": [], "issue_count": 0,
+                      "duration_ms": int((time.time() - started) * 1000)}
+        rid = registry.task("proofread").insert(record_out)
+        return cid, rid, False
+
+
+@api.post("/proofread/scan")
+def proofread_scan():
+    """批量异步扫描。body: {corpus_ids?: [...]}，缺省扫描全部语料。"""
+    data = _payload()
+    store = _registry().task("corpus")
+    ids = data.get("corpus_ids")
+    docs = []
+    if ids:
+        for cid in ids:
+            rec = store.get(cid)
+            if rec and not rec.get("_deleted"):
+                docs.append((cid, rec))
+    else:
+        docs = [(r["id"], r) for r in store.all() if not r.get("_deleted")]
+    if not docs:
+        return jsonify({"error": "没有可扫描的语料"}), 400
+
+    scan_id = uuid.uuid4().hex[:12]
+    state = {"scan_id": scan_id, "total": len(docs), "done": 0,
+             "ok": 0, "failed": 0, "started": time.time(), "finished": None,
+             "items": {}}
+    with _proofread_lock:
+        # 只保留最近 50 次扫描的状态，避免长时间运行后无限增长
+        while len(_proofread_scans) >= 50:
+            oldest = min(_proofread_scans,
+                         key=lambda k: _proofread_scans[k]["started"])
+            del _proofread_scans[oldest]
+        _proofread_scans[scan_id] = state
+
+    ignores_by_doc = {cid: _load_ignores(cid) for cid, _ in docs}
+    protected = _load_protected_words()
+    # 在请求线程内解析好依赖，后台线程不再触碰 current_app
+    registry = _registry()
+    proofreader = get_proofreader()
+
+    def _run():
+        futures = {
+            _proofread_executor.submit(
+                _scan_one_corpus, registry, proofreader, scan_id, cid, rec,
+                ignores_by_doc[cid], protected): cid
+            for cid, rec in docs
+        }
+        for fut in as_completed(futures):
+            cid, rid, ok = fut.result()
+            with _proofread_lock:
+                state["done"] += 1
+                state["ok" if ok else "failed"] += 1
+                state["items"][cid] = {"result_id": rid, "ok": ok}
+        with _proofread_lock:
+            state["finished"] = time.time()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"scan_id": scan_id, "total": len(docs), "ok": True})
+
+
+@api.get("/proofread/scan/<scan_id>")
+def proofread_scan_status(scan_id: str):
+    with _proofread_lock:
+        state = _proofread_scans.get(scan_id)
+        if not state:
+            return jsonify({"error": "扫描任务不存在"}), 404
+        return jsonify(dict(state, items=state["items"]))
+
+
+@api.post("/proofread/check")
+def proofread_check():
+    """同步扫描单篇（text 或 corpus_id），不落库，用于即时体检与审阅刷新。"""
+    data = _payload()
+    text, cid = _resolve_text(data)
+    if not text:
+        return jsonify({"error": "缺少文本"}), 400
+    issues = get_proofreader().scan(
+        text, protected_words=_load_protected_words(),
+        ignores=_load_ignores(cid))
+    return jsonify({
+        "corpus_id": cid, "issues": issues, "issue_count": len(issues),
+        "text_hash": text_hash(text), "text_length": len(text),
+        "rule_names": RULE_NAMES,
+    })
+
+
+@api.get("/proofread/results")
+def proofread_results():
+    """按语料查询最新一次扫描结果（不含 issues 明细，供列表展示）。"""
+    corpus_id = request.args.get("corpus_id")
+    where = []
+    if corpus_id:
+        where.append(("corpus_id", "eq", corpus_id))
+    records = _registry().task("proofread").query(
+        where=where or None, order_by="created_at", order="desc")
+    # 每篇语料只保留最新一条
+    latest: dict[str, dict] = {}
+    for r in records:
+        cid = r.get("corpus_id")
+        if cid not in latest:
+            latest[cid] = {k: r.get(k) for k in (
+                "id", "scan_id", "corpus_id", "corpus_name", "status",
+                "error", "issue_count", "text_hash", "text_length",
+                "duration_ms", "created_at")}
+    items = sorted(latest.values(), key=lambda x: x.get("created_at") or 0,
+                   reverse=True)
+    return jsonify({"results": items})
+
+
+@api.get("/proofread/result/<rid>")
+def proofread_result_detail(rid: str):
+    record = _registry().task("proofread").get(rid)
+    if not record or record.get("_deleted"):
+        return jsonify({"error": "扫描结果不存在"}), 404
+    return jsonify(record)
+
+
+@api.post("/corpus/<cid>/proofread/apply")
+def proofread_apply(cid: str):
+    """把确认的修改写回语料文本。
+
+    body: {base_hash, items: [{start,end,original,replacement}], note?}
+    - base_hash 与当前文本指纹不一致 → 409（语料已被其它修改变更）；
+    - 单项原文不匹配 / 区间重叠 → 进入 conflicts，其余照常应用；
+    - 应用后文本更新、追加一条 revision，下游任务按 corpus_id 取到的
+      即是新文本，结果中的 text_hash 可与 revision 对账。
+    """
+    record = _registry().task("corpus").get(cid)
+    if not record or record.get("_deleted"):
+        return jsonify({"error": "语料不存在"}), 404
+    data = _payload()
+    items = data.get("items") or []
+    if not items:
+        return jsonify({"error": "没有要应用的修改"}), 400
+
+    text = record.get("text", "")
+    current_hash = text_hash(text)
+    base_hash = data.get("base_hash")
+    if base_hash and base_hash != current_hash:
+        return jsonify({
+            "error": "语料内容已被其它修改变更，请重新扫描后再应用",
+            "current_hash": current_hash,
+        }), 409
+
+    outcome = get_proofreader().apply_fixes(text, items)
+    if not outcome["applied"]:
+        return jsonify({"error": "所有修改均与当前文本冲突，未应用任何修改",
+                        "conflicts": outcome["conflicts"]}), 409
+
+    new_text = outcome["text"]
+    revisions = list(record.get("revisions") or [])
+    rev_no = len(revisions) + 1
+    revisions.append({
+        "rev": rev_no, "applied_at": time.time(),
+        "items": outcome["applied"], "conflicts": outcome["conflicts"],
+        "hash_before": current_hash, "hash_after": outcome["text_hash"],
+        "note": data.get("note", ""),
+    })
+    _registry().task("corpus").update(cid, {
+        "text": new_text, "revisions": revisions, "updated_at": time.time(),
+    })
+    return jsonify({
+        "ok": True, "text": new_text, "text_hash": outcome["text_hash"],
+        "revision": rev_no, "applied": len(outcome["applied"]),
+        "conflicts": outcome["conflicts"],
+    })
+
+
+@api.get("/corpus/<cid>/revisions")
+def corpus_revisions(cid: str):
+    record = _registry().task("corpus").get(cid)
+    if not record or record.get("_deleted"):
+        return jsonify({"error": "语料不存在"}), 404
+    return jsonify({
+        "corpus_id": cid, "text_hash": text_hash(record.get("text", "")),
+        "revisions": record.get("revisions") or [],
+    })
+
+
+@api.post("/proofread/ignore")
+def proofread_ignore():
+    """把某条「规则 + 原文 + 改法（+ 上下文）」加入忽略列表，之后扫描不再报。"""
+    data = _payload()
+    if not data.get("rule") or data.get("original") is None:
+        return jsonify({"error": "缺少 rule 或 original"}), 400
+    record = {
+        "rule": data["rule"], "original": data["original"],
+        "replacement": data.get("replacement", ""),
+        "context": data.get("context", ""),
+        "corpus_id": data.get("corpus_id") or "*",
+        "created_at": time.time(),
+    }
+    rid = _registry().task("proofread_ignore").insert(record)
+    return jsonify({"id": rid, "ok": True})
+
+
+@api.get("/proofread/ignores")
+def proofread_ignores():
+    records = [r for r in _registry().task("proofread_ignore").all()
+               if not r.get("_deleted")]
+    return jsonify({"ignores": records})
+
+
+@api.delete("/proofread/ignore/<iid>")
+def proofread_unignore(iid: str):
+    ok = _registry().task("proofread_ignore").delete(iid)
+    return jsonify({"ok": ok})
+
+
+@api.post("/proofread/protect")
+def proofread_protect():
+    """添加保护词（方言 / 专有写法 / 新词），命中区间不再报疑似错误。"""
+    data = _payload()
+    word = (data.get("word") or "").strip()
+    if not word:
+        return jsonify({"error": "保护词不能为空"}), 400
+    store = _registry().task("proofread_dict")
+    for r in store.all():
+        if not r.get("_deleted") and r.get("word") == word:
+            return jsonify({"id": r["id"], "ok": True, "existed": True})
+    rid = store.insert({"word": word, "note": data.get("note", ""),
+                        "created_at": time.time()})
+    return jsonify({"id": rid, "ok": True})
+
+
+@api.get("/proofread/protect")
+def proofread_protect_list():
+    records = [r for r in _registry().task("proofread_dict").all()
+               if not r.get("_deleted")]
+    return jsonify({"words": records})
+
+
+@api.delete("/proofread/protect/<pid>")
+def proofread_unprotect(pid: str):
+    ok = _registry().task("proofread_dict").delete(pid)
+    return jsonify({"ok": ok})
 
 
 # ---------------------------------------------------------------------------
